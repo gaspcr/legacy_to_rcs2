@@ -14,7 +14,6 @@ setup(
         'pandas',
         'tqdm',
         'requests',
-        'astro-datalab',
     ],
     scripts=[
         'bin/query_degrade_hsc',

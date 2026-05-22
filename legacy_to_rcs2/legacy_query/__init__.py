@@ -3,5 +3,7 @@ from legacy_to_rcs2.legacy_query.cutout import (
     LEGACY_NATIVE_PIXSCALE,
     LEGACY_VIEWER_CUTOUT_URL,
 )
-
-# query_tractor_props will be added in task #3
+from legacy_to_rcs2.legacy_query.tractor_props import (
+    query_tractor_props,
+    DATALAB_TAP_SYNC_URL,
+)
