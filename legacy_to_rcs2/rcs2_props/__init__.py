@@ -1,3 +1,8 @@
-# Placeholder. Will expose:
-#   - characterize_rcs2(...)   from characterize_rcs2.py  (task #4)
-#   - rcs2_sampler(...)        from rcs2_samplers.py      (task #5)
+from legacy_to_rcs2.rcs2_props.characterize_rcs2 import (
+    characterize_directory,
+    extract_header_props,
+    measure_noise,
+    measure_seeing,
+)
+
+# rcs2_sampler will be added in task #5
