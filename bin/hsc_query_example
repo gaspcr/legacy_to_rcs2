@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+
+import pkgutil
+
+
+if __name__ == "__main__":
+    example = pkgutil.get_data("legacy_to_rcs2", "data/examples/example_HSC_query.fits")
+    with open("./example_HSC_query.fits", "wb") as f:
+        f.write(example)
+    print("Example HSC query table copied to ./example_HSC_query.fits")
