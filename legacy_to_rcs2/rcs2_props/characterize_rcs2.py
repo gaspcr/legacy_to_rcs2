@@ -75,12 +75,16 @@ def classify_header(header):
       - props is the dict of needed keys when the frame is accepted
         (reason is then None);
       - props is None and reason is the discard code otherwise, one of
-        'band'      (FILTER missing/unparseable or not a grz band) or
-        'no_phot_c' (no PHOT_C -> non-photometric night, discarded
-                     rather than imputed to avoid biasing the sampler).
+        'band'        (FILTER missing/unparseable or not a grz band),
+        'no_phot_c'   (no PHOT_C -> non-photometric night, discarded
+                       rather than imputed to avoid biasing the sampler),
+        'missing_key' (PHOT_C present but EXPTIME or GAIN absent -- e.g.
+                       an empty primary HDU that carries exposure-level
+                       keywords but no per-CCD GAIN; see the off-by-one
+                       note for the funpacked '_00' frames).
 
-    The band check precedes the PHOT_C check, matching the order the
-    cuts are applied, so the reason reflects the first failing condition.
+    Checks run in cut order (band -> phot_c -> required keys) so the
+    reason reflects the first failing condition.
     """
     filt = header.get('FILTER', '')
     m = FILTER_PATTERN.match(filt)
@@ -90,6 +94,11 @@ def classify_header(header):
     phot_c = header.get('PHOT_C', None)
     if phot_c is None:
         return None, 'no_phot_c'
+
+    # EXPTIME and GAIN are mandatory: GAIN feeds the noise model at
+    # degradation time, so a frame without it cannot be characterized.
+    if header.get('EXPTIME') is None or header.get('GAIN') is None:
+        return None, 'missing_key'
 
     return {
         'band': m.group(1),
@@ -237,12 +246,15 @@ def characterize_directory(input_dir, output_csv, bands=RCS2_BANDS,
         fits_files = fits_files[:max_files]
 
     counts = {'processed': len(fits_files), 'discarded_no_phot_c': 0,
-              'discarded_band': 0, 'discarded_io': 0, 'ok': 0}
+              'discarded_band': 0, 'discarded_io': 0,
+              'discarded_no_data': 0, 'discarded_missing_key': 0, 'ok': 0}
     # Map each discard reason code from _process_one to its counter key.
     reason_to_counter = {
         'no_phot_c': 'discarded_no_phot_c',
         'band': 'discarded_band',
         'io': 'discarded_io',
+        'no_data': 'discarded_no_data',
+        'missing_key': 'discarded_missing_key',
     }
 
     fieldnames = ['band', 'frame_id', 'exp_time', 'gain', 'zero_point',
@@ -274,14 +286,22 @@ def characterize_directory(input_dir, output_csv, bands=RCS2_BANDS,
 def _process_one(path, frame_id, bands):
     """Return (row, reason): row is the props dict when accepted (reason
     None), otherwise row is None and reason is the discard code
-    ('io', 'band', 'no_phot_c')."""
+    ('io', 'no_data', 'band', 'no_phot_c', 'missing_key')."""
     try:
         with fits.open(path) as hdul:
             hdr = hdul[0].header
-            image = np.asarray(hdul[0].data, dtype=np.float64)
+            data = hdul[0].data
     except Exception as e:
         logging.warning(f"{frame_id}: read failed: {e}")
         return None, 'io'
+
+    # An empty primary HDU (e.g. a '_00' frame extracted from the .fz
+    # primary) has no pixels to measure. np.asarray(None) would silently
+    # produce a 0-d NaN array, so guard explicitly.
+    if data is None:
+        logging.warning(f"{frame_id}: primary HDU has no image data")
+        return None, 'no_data'
+    image = np.asarray(data, dtype=np.float64)
 
     hdr_props, reason = classify_header(hdr)
     if hdr_props is None:
@@ -320,6 +340,8 @@ def _print_summary(counts, output_csv):
         print(f"Discarded {n - ok} frames:")
         print(f"  no PHOT_C (non-photometric): {counts['discarded_no_phot_c']}")
         print(f"  unsupported/excluded band  : {counts['discarded_band']}")
+        print(f"  empty (no image data)      : {counts['discarded_no_data']}")
+        print(f"  missing EXPTIME/GAIN       : {counts['discarded_missing_key']}")
         print(f"  read / IO error            : {counts['discarded_io']}")
 
 
