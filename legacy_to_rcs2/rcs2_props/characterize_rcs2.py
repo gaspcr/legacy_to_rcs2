@@ -68,28 +68,44 @@ SEEING_FWHM_RANGE_ARCSEC = (0.3, 3.0)    # accept fits within this range
 # ----------------------------------------------------------------------
 
 
-def extract_header_props(header):
-    """Pull the subset of header keys we need. Returns dict or None if
-    the frame must be discarded (no PHOT_C, unsupported band, etc.)."""
+def classify_header(header):
+    """Parse the header once and decide whether the frame is usable.
+
+    Returns (props, reason) where exactly one is non-None:
+      - props is the dict of needed keys when the frame is accepted
+        (reason is then None);
+      - props is None and reason is the discard code otherwise, one of
+        'band'      (FILTER missing/unparseable or not a grz band) or
+        'no_phot_c' (no PHOT_C -> non-photometric night, discarded
+                     rather than imputed to avoid biasing the sampler).
+
+    The band check precedes the PHOT_C check, matching the order the
+    cuts are applied, so the reason reflects the first failing condition.
+    """
     filt = header.get('FILTER', '')
     m = FILTER_PATTERN.match(filt)
-    if m is None:
-        return None
-    band = m.group(1)
-    if band not in RCS2_BANDS:
-        return None
+    if m is None or m.group(1) not in RCS2_BANDS:
+        return None, 'band'
 
     phot_c = header.get('PHOT_C', None)
     if phot_c is None:
-        return None   # discard non-photometric frames
+        return None, 'no_phot_c'
 
     return {
-        'band': band,
+        'band': m.group(1),
         'exp_time': float(header['EXPTIME']),
         'gain': float(header['GAIN']),
         'zero_point': float(phot_c),
         'saturate': float(header.get('SATURATE', 65535.0)),
-    }
+    }, None
+
+
+def extract_header_props(header):
+    """Backward-compatible wrapper: return the props dict, or None if the
+    frame must be discarded. New code should call classify_header() to
+    also obtain the discard reason for logging."""
+    props, _ = classify_header(header)
+    return props
 
 
 # ----------------------------------------------------------------------
@@ -222,6 +238,12 @@ def characterize_directory(input_dir, output_csv, bands=RCS2_BANDS,
 
     counts = {'processed': len(fits_files), 'discarded_no_phot_c': 0,
               'discarded_band': 0, 'discarded_io': 0, 'ok': 0}
+    # Map each discard reason code from _process_one to its counter key.
+    reason_to_counter = {
+        'no_phot_c': 'discarded_no_phot_c',
+        'band': 'discarded_band',
+        'io': 'discarded_io',
+    }
 
     fieldnames = ['band', 'frame_id', 'exp_time', 'gain', 'zero_point',
                   'seeing', 'rms', 'median', 'n_stars']
@@ -235,9 +257,11 @@ def characterize_directory(input_dir, output_csv, bands=RCS2_BANDS,
             if verbose:
                 print(f"[{i}/{len(fits_files)}] {frame_id}")
 
-            row = _process_one(path, frame_id, bands)
+            row, reason = _process_one(path, frame_id, bands)
             if row is None:
-                # already counted internally via the discard reason
+                counts[reason_to_counter[reason]] += 1
+                if verbose:
+                    print(f"    discarded ({reason})")
                 continue
 
             writer.writerow(row)
@@ -246,26 +270,24 @@ def characterize_directory(input_dir, output_csv, bands=RCS2_BANDS,
     _print_summary(counts, output_csv)
     return counts
 
-    # Per-discard reason accounting is done inside _process_one, but
-    # since it returns None for any rejection we tally globally above.
-    # If a finer breakdown is needed, _process_one can be extended to
-    # return a reason code.
-
 
 def _process_one(path, frame_id, bands):
+    """Return (row, reason): row is the props dict when accepted (reason
+    None), otherwise row is None and reason is the discard code
+    ('io', 'band', 'no_phot_c')."""
     try:
         with fits.open(path) as hdul:
             hdr = hdul[0].header
             image = np.asarray(hdul[0].data, dtype=np.float64)
     except Exception as e:
         logging.warning(f"{frame_id}: read failed: {e}")
-        return None
+        return None, 'io'
 
-    hdr_props = extract_header_props(hdr)
+    hdr_props, reason = classify_header(hdr)
     if hdr_props is None:
-        return None
+        return None, reason
     if hdr_props['band'] not in bands:
-        return None
+        return None, 'band'   # excluded by the --bands selection
 
     median, rms = measure_noise(image)
     seeing, n_stars = measure_seeing(image, hdr_props['saturate'])
@@ -280,7 +302,7 @@ def _process_one(path, frame_id, bands):
         'rms': rms,
         'median': median,
         'n_stars': n_stars,
-    }
+    }, None
 
 
 def _iter_fits(root):
@@ -295,8 +317,10 @@ def _print_summary(counts, output_csv):
     ok = counts['ok']
     print(f"\nDone. {ok}/{n} frames written to {output_csv}")
     if n > 0 and ok < n:
-        print(f"Discarded {n - ok} frames "
-              f"(no PHOT_C / unsupported band / IO error).")
+        print(f"Discarded {n - ok} frames:")
+        print(f"  no PHOT_C (non-photometric): {counts['discarded_no_phot_c']}")
+        print(f"  unsupported/excluded band  : {counts['discarded_band']}")
+        print(f"  read / IO error            : {counts['discarded_io']}")
 
 
 # ----------------------------------------------------------------------
