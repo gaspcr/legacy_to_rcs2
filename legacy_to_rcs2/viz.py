@@ -6,25 +6,32 @@ dependency; the import is done lazily inside the function.
 
 import numpy as np
 
+# RGB composite tuning: per-band scaling percentile and LogStretch parameter.
+PCTL = 99.5
+LOG_A = 1000.0
 
-def _lupton_rgb(images, bands):
+
+def _rgb_stamp(images, bands, pctl=PCTL, a=LOG_A):
     """Build an 8-bit RGB composite from g, r, z planes (z->R, r->G, g->B).
 
-    A single asinh stretch (common minimum and span from the combined robust
-    percentiles) is shared across the three planes so the relative band colours
-    are preserved; the overall level adapts to the image set.
+    Each band is scaled to its own ``pctl`` percentile and then mapped through
+    a LogStretch over [0, 1]. Per-band scaling balances the channels regardless
+    of their absolute flux units (so it works for both the Legacy cutout and
+    the degraded RCS2 stamp).
     """
-    from astropy.visualization import make_lupton_rgb
+    from astropy.visualization import make_rgb, ManualInterval, LogStretch
 
     idx = {b: i for i, b in enumerate(bands)}
-    r = np.nan_to_num(np.asarray(images[idx['z']], dtype=float))
-    g = np.nan_to_num(np.asarray(images[idx['r']], dtype=float))
-    b = np.nan_to_num(np.asarray(images[idx['g']], dtype=float))
-    combined = np.concatenate([r.ravel(), g.ravel(), b.ravel()])
-    lo = np.percentile(combined, 50.0)        # ~background level
-    hi = np.percentile(combined, 99.5)        # ~bright source level
-    span = max(hi - lo, 1e-6)
-    return make_lupton_rgb(r, g, b, minimum=lo, stretch=span, Q=8)
+
+    def _scaled(band):
+        stamp = np.asarray(images[idx[band]], dtype=float)
+        stamp = np.where(np.isfinite(stamp), stamp, 0.0)
+        vmax = np.percentile(stamp, pctl)
+        return stamp / max(vmax, 1e-12)
+
+    return make_rgb(_scaled('z'), _scaled('r'), _scaled('g'),
+                    interval=ManualInterval(vmin=0, vmax=1),
+                    stretch=LogStretch(a=a))
 
 
 def plot_original_vs_degraded(original_images, degraded_images, bands,
@@ -71,7 +78,7 @@ def plot_original_vs_degraded(original_images, degraded_images, bands,
     if add_rgb:
         for col, label, images in columns:
             ax = axes[0][col]
-            ax.imshow(_lupton_rgb(images, bands), origin='lower')
+            ax.imshow(_rgb_stamp(images, bands), origin='lower')
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_title(label, fontsize=10)
