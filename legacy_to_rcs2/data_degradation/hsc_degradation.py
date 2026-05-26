@@ -1,7 +1,6 @@
 __author__ = "furcelay"
 
 from astropy.nddata import Cutout2D
-from lenstronomy.SimulationAPI.ObservationConfig.LSST import LSST
 from legacy_to_rcs2.data_degradation.psf import degrade_psf
 from legacy_to_rcs2.data_degradation.resample import resample_image
 from legacy_to_rcs2.data_degradation.noise import add_noise
@@ -17,6 +16,7 @@ def legacy_to_rcs2(
         hsc_fwhm=0.6,
         hsc_psf=None,
         hsc_pix_scale=0.168,
+        target_pix_scale=0.185,
         lsst_fwhm=None,
         lsst_psf=None,
         background_noise=None,
@@ -37,6 +37,7 @@ def legacy_to_rcs2(
     :param hsc_fwhm: float, FWHM of HSC PSF in arcsec, only used if the PSF model is not provided
     :param hsc_psf: 2D numpy array of PSF model for HSC image, if None a Gaussian PSF with hsc_fwhm is used
     :param hsc_pix_scale: float, pixel scale of HSC image in arcsec/pixel
+    :param target_pix_scale: float, output pixel scale in arcsec/pixel (RCS2/MegaCam = 0.185)
     :param lsst_fwhm: float, FWHM of LSST PSF in arcsec, only used if the PSF model is not provided
     :param lsst_psf: 2D numpy array of PSF model for LSST image, if None a Gaussian PSF with lsst_fwhm is used
     :param background_noise: float, background noise RMS for LSST image
@@ -48,10 +49,13 @@ def legacy_to_rcs2(
     :param out_size: int, output image size in pixels (output image is square)
     :return: 2D numpy array of degraded LSST-like image
     """
-    lsst_band_props = LSST(band=lsst_band).kwargs_single_band()
     if lsst_fwhm is None:
-        lsst_fwhm = lsst_band_props['seeing']
-    lsst_pix_scale = lsst_band_props['pixel_scale']
+        raise ValueError(
+            "lsst_fwhm (target RCS2 seeing FWHM in arcsec) is required; "
+            "the sampler must supply it."
+        )
+    # Output pixel scale, explicit RCS2/MegaCam value (replaces the lenstronomy LSST lookup).
+    lsst_pix_scale = target_pix_scale
     # PSF
     if psf_transform:
         hsc_img_conv = degrade_psf(
@@ -77,7 +81,6 @@ def legacy_to_rcs2(
     # noise
     if add_poisson_noise or add_background_noise:
         hsc_img_conv_scaled_noise = add_noise(hsc_img_conv_scaled,
-                                              lsst_band_props,
                                               exp_time,
                                               lsst_zero_point,
                                               background_noise=background_noise,

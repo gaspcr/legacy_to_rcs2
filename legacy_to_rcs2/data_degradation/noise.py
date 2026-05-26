@@ -1,12 +1,10 @@
 __author__ = "furcelay"
 
 from legacy_to_rcs2.utils import photutils_background_iterative
-from lenstronomy.Util import data_util
 import numpy as np
 
 
 def add_noise(img,
-              lsst_band_props,
               exp_time=30.0,
               zero_point=27.0,
               background_noise=None,
@@ -20,10 +18,9 @@ def add_noise(img,
     """Add noise to an image to match LSST-like observations.
 
     :param img: 2D numpy array of input image already scaled to LSST zero point
-    :param lsst_band_props: list of LSST band properties (see lenstronomy.SimulationAPI.ObservationConfig.LSST.LSST)
     :param exp_time: float, LSST exposure time in seconds
     :param zero_point: float, LSST zero point magnitude of the coadd or single exposure
-    :param background_noise: float, background noise RMS for LSST image
+    :param background_noise: float, target background noise RMS (required; supplied by the RCS2 sampler)
     :param background_median: float, background median level for LSST image
     :param add_poisson_noise: bool, whether to add Poisson noise
     :param add_background_noise: bool, whether to add background noise
@@ -35,8 +32,6 @@ def add_noise(img,
 
     img_median, img_std, _ = photutils_background_iterative(img)
     img = img - img_median
-
-    num_exposures = exp_time / 15
 
     if single_exposure_zero_point is not None:
         # Correct for the difference in zero points from the single exposure.
@@ -53,20 +48,11 @@ def add_noise(img,
 
     if add_background_noise:
         if background_noise is None:
-            sky_brightness_cps = data_util.magnitude2cps(
-                    lsst_band_props['sky_brightness'],
-                    magnitude_zero_point=zero_point,
-                )
-
-            bkg_noise = data_util.bkg_noise(
-                    lsst_band_props['read_noise'],
-                    15,
-                    sky_brightness_cps,
-                    lsst_band_props['pixel_scale'],
-                    num_exposures,
-                )
-        else:
-            bkg_noise = background_noise
+            raise ValueError(
+                "background_noise (target RCS2 sky RMS) is required; "
+                "the sampler must supply it."
+            )
+        bkg_noise = background_noise
         if bkg_noise > img_std:
             if use_noise_diff:
                 noise = np.random.normal(scale=np.sqrt(bkg_noise**2 - img_std**2),
