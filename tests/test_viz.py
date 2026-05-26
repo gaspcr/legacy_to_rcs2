@@ -13,7 +13,7 @@ from legacy_to_rcs2.viz import plot_original_vs_degraded
 
 
 def test_plot_creates_nonempty_png():
-    """A comparison figure is written and is a non-empty PNG."""
+    """A comparison figure (with the grz RGB row) is written and non-empty."""
     rng = np.random.default_rng(0)
     original = [rng.normal(0, 1, (46, 46)) for _ in 'grz']
     degraded = [rng.normal(0, 1, (65, 65)) for _ in 'grz']
@@ -23,6 +23,19 @@ def test_plot_creates_nonempty_png():
                                         title='demo')
         assert ret == out
         assert os.path.exists(out) and os.path.getsize(out) > 0
+
+
+def test_plot_rgb_toggle():
+    """The grz RGB row is optional; both with and without it render."""
+    rng = np.random.default_rng(1)
+    original = [rng.normal(5, 1, (46, 46)) for _ in 'grz']
+    degraded = [rng.normal(5, 1, (65, 65)) for _ in 'grz']
+    with tempfile.TemporaryDirectory() as tmp:
+        with_rgb = plot_original_vs_degraded(original, degraded, 'grz',
+                                             os.path.join(tmp, 'rgb.png'), rgb=True)
+        no_rgb = plot_original_vs_degraded(original, degraded, 'grz',
+                                           os.path.join(tmp, 'norgb.png'), rgb=False)
+        assert os.path.getsize(with_rgb) > 0 and os.path.getsize(no_rgb) > 0
 
 
 def test_plot_handles_nan_pixels():
@@ -51,6 +64,7 @@ def test_plot_length_mismatch_raises():
 def _run_all_and_report():
     tests = [
         test_plot_creates_nonempty_png,
+        test_plot_rgb_toggle,
         test_plot_handles_nan_pixels,
         test_plot_length_mismatch_raises,
     ]

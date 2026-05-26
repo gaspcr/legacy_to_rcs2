@@ -45,13 +45,48 @@ def parse_args():
                         help="Also save an original-vs-degraded comparison PNG per source")
     parser.add_argument("--layer", type=str, default="ls-dr10",
                         help="Legacy Survey layer (default 'ls-dr10')")
-    parser.add_argument("--cutout_size_pix", type=int, default=80,
-                        help="Legacy cutout download size in px (default 80)")
-    parser.add_argument("--stamp_pix", type=int, default=65,
-                        help="Output RCS2 stamp size in px (default 65)")
+    # Sizes can be given in arcsec (natural for trying different FOVs) or in
+    # pixels. If --rcs2_arcsec / --legacy_arcsec are set they override the
+    # pixel values; if only --rcs2_arcsec is given the Legacy cutout is
+    # auto-sized (with margin) to cover it.
+    parser.add_argument("--rcs2_arcsec", type=float, default=None,
+                        help="RCS2 stamp size in arcsec (overrides --stamp_pix)")
+    parser.add_argument("--legacy_arcsec", type=float, default=None,
+                        help="Legacy cutout size in arcsec (overrides --cutout_size_pix)")
+    parser.add_argument("--cutout_size_pix", type=int, default=120,
+                        help="Legacy cutout download size in px (default 120 ~31 arcsec)")
+    parser.add_argument("--stamp_pix", type=int, default=162,
+                        help="Output RCS2 stamp size in px (default 162 ~30 arcsec at 0.185 arcsec/px)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Base seed for the RCS2 condition sampler")
     return parser.parse_args()
+
+
+def resolve_sizes(args):
+    """Resolve the RCS2 stamp and Legacy cutout sizes (px) from the arcsec or
+    pixel arguments, and check the cutout covers the stamp after resampling."""
+    if args.rcs2_arcsec is not None:
+        stamp_pix = int(round(args.rcs2_arcsec / RCS2_PIX_SCALE))
+    else:
+        stamp_pix = args.stamp_pix
+
+    if args.legacy_arcsec is not None:
+        cutout_size_pix = int(round(args.legacy_arcsec / LEGACY_PIX_SCALE))
+    elif args.rcs2_arcsec is not None:
+        # Auto-size the Legacy cutout to cover the RCS2 FOV with ~15% margin.
+        cutout_size_pix = int(np.ceil(1.15 * stamp_pix * RCS2_PIX_SCALE / LEGACY_PIX_SCALE))
+    else:
+        cutout_size_pix = args.cutout_size_pix
+
+    # After resampling 0.262 -> 0.185, the cutout must still cover the stamp.
+    resampled_pix = int(cutout_size_pix * LEGACY_PIX_SCALE / RCS2_PIX_SCALE)
+    if resampled_pix < stamp_pix:
+        raise SystemExit(
+            f"Legacy cutout ({cutout_size_pix} px = {cutout_size_pix * LEGACY_PIX_SCALE:.1f} arcsec) "
+            f"is too small to cover the RCS2 stamp ({stamp_pix} px = "
+            f"{stamp_pix * RCS2_PIX_SCALE:.1f} arcsec); increase --legacy_arcsec / --cutout_size_pix."
+        )
+    return stamp_pix, cutout_size_pix
 
 
 def load_coords(path):
@@ -80,6 +115,9 @@ def center_crop(img, size):
 def main():
     args = parse_args()
     bands = args.bands
+    stamp_pix, cutout_size_pix = resolve_sizes(args)
+    print(f"RCS2 stamp {stamp_pix} px (~{stamp_pix * RCS2_PIX_SCALE:.1f} arcsec), "
+          f"Legacy cutout {cutout_size_pix} px (~{cutout_size_pix * LEGACY_PIX_SCALE:.1f} arcsec)")
     coords = load_coords(args.input)
     rcs2_sampler = load_rcs2_sampler(args.rcs2_props_csv, bands=bands, seed=args.seed)
 
@@ -90,19 +128,19 @@ def main():
     log_file = os.path.join(args.output_dir, "example_err.log")
 
     # Legacy pixels covering the same sky area as the RCS2 stamp (for the plot).
-    match_px = int(round(args.stamp_pix * RCS2_PIX_SCALE / LEGACY_PIX_SCALE))
+    match_px = int(round(stamp_pix * RCS2_PIX_SCALE / LEGACY_PIX_SCALE))
 
     n_ok = 0
     for idx, row in enumerate(coords):
         ra, dec = float(row['ra']), float(row['dec'])
         try:
             cutout = query_legacy_cutout(ra, dec, bands=bands, layer=args.layer,
-                                         size_pix=args.cutout_size_pix)
+                                         size_pix=cutout_size_pix)
             tractor_props = query_tractor_props(ra, dec, bands=bands)
             original = [cutout[b]['image'] for b in bands]
             ok, degraded, _ = degrade_images(
                 original, tractor_props, rcs2_sampler, bands=bands,
-                out_size_pix=args.stamp_pix, log_file=log_file,
+                out_size_pix=stamp_pix, log_file=log_file,
             )
         except Exception as e:
             print(f"[{idx:03d}] ({ra:.4f},{dec:.4f}) query/degrade failed: "
