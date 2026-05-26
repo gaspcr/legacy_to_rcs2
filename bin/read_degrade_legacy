@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Degrade cached Legacy DR10 cutouts (written by query_legacy) to RCS2-like
+grz stamps, in parallel.
+
+Reads <idx>_img_<band>.fits cutouts from an input directory and writes
+<idx>_<band>.fits degraded stamps. The RCS2 target conditions are drawn per
+band by the sampler built from a characterize_rcs2 CSV (--rcs2_props_csv).
+Adapted from the HSC_to_LSST CLI (read_degrade_hsc).
+"""
+
+from legacy_to_rcs2.pipeline import read_degrade_write
+from legacy_to_rcs2.rcs2_props.rcs2_samplers import load_rcs2_sampler, reseed_samplers
+from tqdm import tqdm
+from multiprocessing import Pool, Lock
+from argparse import ArgumentParser
+import os
+import sys
+import datetime
+
+
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("input_directory", type=str,
+                        help="Directory of cached cutouts from query_legacy")
+    parser.add_argument("--rcs2_props_csv", type=str, required=True,
+                        help="characterize_rcs2 CSV the RCS2 sampler draws from")
+    parser.add_argument("--output_dir", '-o', type=str, default=None,
+                        help="Output directory (default: <input_directory>_degraded)")
+    parser.add_argument("--bands", type=str, default="grz",
+                        help="Bands to degrade (default 'grz')")
+    parser.add_argument("--stamp_pix", type=int, default=65,
+                        help="Output RCS2 stamp size in px (default 65 = 12\" at 0.185\"/px)")
+    parser.add_argument("--num_processes", '-np', type=int, default=10,
+                        help="Number of worker processes")
+    parser.add_argument("--rms_frac_thresh", type=float, default=0.3,
+                        help="RMS fraction threshold for the zero-point conversion")
+    parser.add_argument("--max_mag_change", type=float, default=0.5,
+                        help="Max magnitude change allowed in the zero-point conversion")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base seed for the RCS2 condition sampler (reproducibility)")
+    parser.add_argument("--restart", "-r", action="store_true",
+                        help="Resume from the last successful source")
+    parser.add_argument("--retry", "-rr", action="store_true",
+                        help="Resume and retry failed sources")
+    return parser.parse_args()
+
+
+timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+args = parse_args()
+last_band = args.bands[-1]
+
+# Source ids are the filename stems before the first underscore
+# (e.g. '000123' from '000123_img_g.fits').
+input_files = os.listdir(args.input_directory)
+input_ids = sorted({f.split("_")[0] for f in input_files if f.endswith(".fits")})
+
+out_dir = args.output_dir
+if out_dir is None:
+    out_dir = args.input_directory.rstrip("/") + "_degraded"
+
+# Build the RCS2 sampler once in the parent; workers inherit it via fork.
+rcs2_sampler = load_rcs2_sampler(args.rcs2_props_csv, bands=args.bands)
+
+os.makedirs(out_dir, exist_ok=True)
+
+
+def sentinel(idx):
+    return f"{idx}_{last_band}.fits"
+
+
+if args.retry:
+    degraded = os.listdir(out_dir)
+    run_list = [idx for idx in input_ids if sentinel(idx) not in degraded]
+elif args.restart:
+    degraded = sorted(os.listdir(out_dir))
+    done = [d for d in degraded if d.endswith(f"_{last_band}.fits")]
+    if done:
+        last_idx = done[-1].replace(f"_{last_band}.fits", "")
+        start_id = input_ids.index(last_idx) + 1 if last_idx in input_ids else 0
+    else:
+        start_id = 0
+    run_list = input_ids[start_id:]
+else:
+    if os.listdir(out_dir):
+        print("Output directory is not empty, use --retry or --restart or empty it")
+        sys.exit(1)
+    if os.path.exists(f"{out_dir}_err.log"):
+        os.remove(f"{out_dir}_err.log")
+    run_list = input_ids
+
+if not os.path.exists(f"{out_dir}_out_{timestamp}.log"):
+    with open(f"{out_dir}_out.log", "w") as f:
+        f.write(f"{'ID':6s}\t{'Success':5s}\tmag_change\n")
+
+
+def process_row(idx):
+    in_filename = os.path.join(args.input_directory, idx)
+    out_filename = os.path.join(out_dir, idx)
+    succeed_, mag_change_ = read_degrade_write(
+        in_filename,
+        out_filename,
+        rcs2_sampler,
+        bands=args.bands,
+        zp_rms_frac_thresh=args.rms_frac_thresh,
+        zp_max_mag_change=args.max_mag_change,
+        out_size_pix=args.stamp_pix,
+        log_file=f"{out_dir}_err.log",
+        log_lock=log_lock,
+        log_prefix=f"{idx}: ",
+    )
+    return idx, succeed_, mag_change_
+
+
+def init_child(log_lock_):
+    global log_lock
+    log_lock = log_lock_
+    # Decorrelate the bootstrap draws across forked workers.
+    reseed_samplers(rcs2_sampler, args.seed)
+
+
+if __name__ == "__main__":
+    log_lock = Lock()
+
+    with Pool(args.num_processes, initializer=init_child,
+              initargs=(log_lock,)) as pool:
+        for (idx, success, mag_change) in tqdm(pool.imap(process_row, run_list),
+                                               total=len(run_list)):
+            with open(f"{out_dir}_out_{timestamp}.log", "a") as f:
+                f.write(f"{idx}\t{str(success):5s}\t{mag_change:.3f}\n")
+
+    degraded = os.listdir(out_dir)
+    num_completed = sum(sentinel(idx) in degraded for idx in input_ids)
+    print(f"All done, completed: {num_completed}, "
+          f"failed: {len(input_ids) - num_completed}")

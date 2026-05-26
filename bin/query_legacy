@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Download and cache Legacy DR10 grz cutouts for a catalogue of (ra, dec),
+in parallel, WITHOUT degrading them.
+
+Each source is cached as <idx>_img_<band>.fits with the tractor PSF FWHM and
+per-pixel RMS in the header, so read_degrade_legacy can degrade it offline --
+possibly many times with different sampled RCS2 conditions (augmentation).
+Adapted from the HSC_to_LSST CLI (query_hsc).
+"""
+
+from legacy_to_rcs2.pipeline import query_and_write
+from tqdm import tqdm
+from multiprocessing import Pool, BoundedSemaphore, Lock
+from argparse import ArgumentParser
+from astropy.table import Table
+import os
+import sys
+import datetime
+
+
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("input_table", type=str,
+                        help="Input astropy table .fits with 'ra' and 'dec' columns")
+    parser.add_argument("--output_dir", '-o', type=str, default=None,
+                        help="Output directory (default: <input_table>_query)")
+    parser.add_argument("--bands", type=str, default="grz",
+                        help="Bands to query (default 'grz')")
+    parser.add_argument("--layer", type=str, default="ls-dr10",
+                        help="Legacy Survey layer (default 'ls-dr10')")
+    parser.add_argument("--cutout_size_pix", type=int, default=80,
+                        help="Legacy cutout download size in px (default 80)")
+    parser.add_argument("--num_processes", '-np', type=int, default=10,
+                        help="Number of worker processes")
+    parser.add_argument("--num_connections", '-nc', type=int, default=8,
+                        help="Max concurrent HTTP queries (Legacy viewer + Data Lab TAP)")
+    parser.add_argument("--timeout", '-t', type=int, default=60,
+                        help="Per-request HTTP timeout in seconds")
+    parser.add_argument("--restart", "-r", action="store_true",
+                        help="Resume from the last successful row")
+    parser.add_argument("--retry", "-rr", action="store_true",
+                        help="Resume and retry failed rows")
+    return parser.parse_args()
+
+
+timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+args = parse_args()
+catalog = Table.read(args.input_table)
+last_band = args.bands[-1]
+
+out_dir = args.output_dir
+if out_dir is None:
+    out_dir = os.path.splitext(args.input_table)[0] + "_query"
+
+os.makedirs(out_dir, exist_ok=True)
+
+
+def sentinel(idx):
+    return f"{idx:06d}_img_{last_band}.fits"
+
+
+if args.retry:
+    queried = os.listdir(out_dir)
+    run_list = [i for i in range(len(catalog)) if sentinel(i) not in queried]
+elif args.restart:
+    queried = sorted(os.listdir(out_dir))
+    done = [d for d in queried if d.endswith(f"_img_{last_band}.fits")]
+    start_id = (int(done[-1].replace(f"_img_{last_band}.fits", "")) + 1) if done else 0
+    run_list = range(start_id, len(catalog))
+else:
+    if os.listdir(out_dir):
+        print("Output directory is not empty, use --retry or --restart or empty it")
+        sys.exit(1)
+    if os.path.exists(f"{out_dir}_err.log"):
+        os.remove(f"{out_dir}_err.log")
+    run_list = range(len(catalog))
+
+if not os.path.exists(f"{out_dir}_out_{timestamp}.log"):
+    with open(f"{out_dir}_out.log", "w") as f:
+        f.write(f"{'ID':6s}\t{'Success':5s}\n")
+
+
+def process_row(idx):
+    row = catalog[idx]
+    ra, dec = row['ra'], row['dec']
+    out_filename = os.path.join(out_dir, f"{idx:06d}")
+    succeed = query_and_write(
+        out_filename,
+        ra,
+        dec,
+        semaphore,
+        bands=args.bands,
+        layer=args.layer,
+        cutout_size_pix=args.cutout_size_pix,
+        query_timeout=args.timeout,
+        log_file=f"{out_dir}_err.log",
+        log_lock=log_lock,
+        log_prefix=f"{idx:06d}: ",
+    )
+    return idx, succeed
+
+
+def init_child(semaphore_, log_lock_):
+    global semaphore, log_lock
+    semaphore = semaphore_
+    log_lock = log_lock_
+
+
+if __name__ == "__main__":
+    semaphore = BoundedSemaphore(args.num_connections)
+    log_lock = Lock()
+
+    with Pool(args.num_processes, initializer=init_child,
+              initargs=(semaphore, log_lock)) as pool:
+        for (i, success) in tqdm(pool.imap(process_row, run_list),
+                                 total=len(run_list)):
+            with open(f"{out_dir}_out_{timestamp}.log", "a") as f:
+                f.write(f"{i:06d}\t{str(success):5s}\n")
+
+    queried = os.listdir(out_dir)
+    num_completed = sum(sentinel(i) in queried for i in range(len(catalog)))
+    print(f"All done, completed: {num_completed}, "
+          f"failed: {len(catalog) - num_completed}")

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Download Legacy DR10 cutouts for a catalogue of (ra, dec) and degrade them
+to RCS2-like grz stamps, in parallel.
+
+Adapted from the HSC_to_LSST CLI (query_degrade_hsc) for the Legacy -> RCS2
+pipeline. The RCS2 target conditions are drawn per band by the sampler built
+from a characterize_rcs2 CSV (--rcs2_props_csv).
+"""
+
+from legacy_to_rcs2.pipeline import query_degrade_write
+from legacy_to_rcs2.rcs2_props.rcs2_samplers import load_rcs2_sampler, reseed_samplers
+from tqdm import tqdm
+from multiprocessing import Pool, BoundedSemaphore, Lock
+from argparse import ArgumentParser
+from astropy.table import Table
+import os
+import sys
+import datetime
+
+
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("input_table", type=str,
+                        help="Input astropy table .fits with 'ra' and 'dec' columns")
+    parser.add_argument("--rcs2_props_csv", type=str, required=True,
+                        help="characterize_rcs2 CSV the RCS2 sampler draws from")
+    parser.add_argument("--output_dir", '-o', type=str, default=None,
+                        help="Output directory (default: <input_table>_degraded)")
+    parser.add_argument("--bands", type=str, default="grz",
+                        help="Bands to query and degrade (default 'grz')")
+    parser.add_argument("--layer", type=str, default="ls-dr10",
+                        help="Legacy Survey layer (default 'ls-dr10')")
+    parser.add_argument("--stamp_pix", type=int, default=65,
+                        help="Output RCS2 stamp size in px (default 65 = 12\" at 0.185\"/px)")
+    parser.add_argument("--cutout_size_pix", type=int, default=80,
+                        help="Legacy cutout download size in px (default 80)")
+    parser.add_argument("--num_processes", '-np', type=int, default=10,
+                        help="Number of worker processes")
+    parser.add_argument("--num_connections", '-nc', type=int, default=8,
+                        help="Max concurrent HTTP queries (Legacy viewer + Data Lab TAP)")
+    parser.add_argument("--timeout", '-t', type=int, default=60,
+                        help="Per-request HTTP timeout in seconds")
+    parser.add_argument("--rms_frac_thresh", type=float, default=0.3,
+                        help="RMS fraction threshold for the zero-point conversion")
+    parser.add_argument("--max_mag_change", type=float, default=0.5,
+                        help="Max magnitude change allowed in the zero-point conversion")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base seed for the RCS2 condition sampler (reproducibility)")
+    parser.add_argument("--restart", "-r", action="store_true",
+                        help="Resume from the last successful row")
+    parser.add_argument("--retry", "-rr", action="store_true",
+                        help="Resume and retry failed rows")
+    return parser.parse_args()
+
+
+timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+args = parse_args()
+catalog = Table.read(args.input_table)
+last_band = args.bands[-1]  # success sentinel uses the last-written band
+
+out_dir = args.output_dir
+if out_dir is None:
+    out_dir = os.path.splitext(args.input_table)[0] + "_degraded"
+
+# Build the RCS2 sampler once in the parent; workers inherit it via fork.
+rcs2_sampler = load_rcs2_sampler(args.rcs2_props_csv, bands=args.bands)
+
+os.makedirs(out_dir, exist_ok=True)
+
+
+def sentinel(idx):
+    return f"{idx:06d}_{last_band}.fits"
+
+
+if args.retry:
+    degraded = os.listdir(out_dir)
+    run_list = [i for i in range(len(catalog)) if sentinel(i) not in degraded]
+elif args.restart:
+    degraded = sorted(os.listdir(out_dir))
+    done = [d for d in degraded if d.endswith(f"_{last_band}.fits")]
+    start_id = (int(done[-1].replace(f"_{last_band}.fits", "")) + 1) if done else 0
+    run_list = range(start_id, len(catalog))
+else:
+    if os.listdir(out_dir):
+        print("Output directory is not empty, use --retry or --restart or empty it")
+        sys.exit(1)
+    for suffix in ("_out.log", "_err.log"):
+        if os.path.exists(f"{out_dir}{suffix}"):
+            os.remove(f"{out_dir}{suffix}")
+    run_list = range(len(catalog))
+
+if not os.path.exists(f"{out_dir}_out_{timestamp}.log"):
+    with open(f"{out_dir}_out.log", "w") as f:
+        f.write(f"{'ID':6s}\t{'Success':5s}\tmag_change\n")
+
+
+def process_row(idx):
+    row = catalog[idx]
+    ra, dec = row['ra'], row['dec']
+    out_filename = os.path.join(out_dir, f"{idx:06d}")
+    succeed_, mag_change_ = query_degrade_write(
+        out_filename,
+        ra,
+        dec,
+        rcs2_sampler,
+        semaphore,
+        bands=args.bands,
+        layer=args.layer,
+        cutout_size_pix=args.cutout_size_pix,
+        query_timeout=args.timeout,
+        zp_rms_frac_thresh=args.rms_frac_thresh,
+        zp_max_mag_change=args.max_mag_change,
+        out_size_pix=args.stamp_pix,
+        log_file=f"{out_dir}_err.log",
+        log_lock=log_lock,
+        log_prefix=f"{idx:06d}: ",
+    )
+    return idx, succeed_, mag_change_
+
+
+def init_child(semaphore_, log_lock_):
+    global semaphore, log_lock
+    semaphore = semaphore_
+    log_lock = log_lock_
+    # Decorrelate the bootstrap draws across forked workers.
+    reseed_samplers(rcs2_sampler, args.seed)
+
+
+if __name__ == "__main__":
+    semaphore = BoundedSemaphore(args.num_connections)
+    log_lock = Lock()
+
+    with Pool(args.num_processes, initializer=init_child,
+              initargs=(semaphore, log_lock)) as pool:
+        for (i, success, mag_change) in tqdm(pool.imap(process_row, run_list),
+                                             total=len(run_list)):
+            with open(f"{out_dir}_out_{timestamp}.log", "a") as f:
+                f.write(f"{i:06d}\t{str(success):5s}\t{mag_change:.3f}\n")
+
+    degraded = os.listdir(out_dir)
+    num_completed = sum(sentinel(i) in degraded for i in range(len(catalog)))
+    print(f"All done, completed: {num_completed}, "
+          f"failed: {len(catalog) - num_completed}")
