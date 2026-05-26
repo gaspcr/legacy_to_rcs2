@@ -148,7 +148,8 @@ def test_degrade_images_wiring():
         assert kw['exp_time'] == s['exp_time']
         assert kw['lsst_zero_point'] == s['zero_point']
         assert kw['lsst_fwhm'] == s['seeing']
-        assert kw['background_noise'] == s['rms']
+        # Background noise is the sky rms converted to ADU/s (per-second ZP).
+        assert kw['background_noise'] == s['rms'] / s['exp_time']
         assert kw['background_median'] == s['median']
         # Legacy PSF: Gaussian of the tractor FWHM, no 2D PSF model.
         assert kw['hsc_fwhm'] == TRACTOR_PROPS[band]['fwhm_arcsec']
@@ -177,7 +178,9 @@ def test_zero_point_step_uses_legacy_zp():
 
     assert zp_rec['original_zp'] == pipeline.LEGACY_ZERO_POINT == 22.5
     assert zp_rec['target_zp'] == [RCS2_STATS[b]['zero_point'] for b in bands]
-    assert zp_rec['target_rms'] == [RCS2_STATS[b]['rms'] for b in bands]
+    # Target rms passed to the zero-point gate is in ADU/s (rms / exp_time).
+    assert zp_rec['target_rms'] == [RCS2_STATS[b]['rms'] / RCS2_STATS[b]['exp_time']
+                                    for b in bands]
     assert zp_rec['rms_frac_thresh'] == 0.3
 
 

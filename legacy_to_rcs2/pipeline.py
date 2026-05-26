@@ -92,15 +92,17 @@ def degrade_images(
     # Sample RCS2 destination conditions, one coherent draw per band.
     rcs2_stats = [rcs2_sampler[band].sample() for band in bands]
 
-    # Scale every band to the RCS2 zero point (or an intermediate,
-    # colour-preserving one if the Legacy noise floor does not allow it).
-    rcs2_rms = [s['rms'] for s in rcs2_stats]
+    # MegaCam/Elixir PHOT_C is a per-second (ADU/s) zero point, so after
+    # zero_point_change the image is a count RATE. The sampled sky rms is in
+    # total ADU (measured on the raw frame), so divide by exp_time to put the
+    # noise in the same ADU/s units as the image and the zero point.
+    rcs2_rms_cps = [s['rms'] / s['exp_time'] for s in rcs2_stats]
     rcs2_zero_points = [s['zero_point'] for s in rcs2_stats]
     images, mag_change = zero_point_change(
         images,
         LEGACY_ZERO_POINT,
         rcs2_zero_points,
-        rcs2_rms,
+        rcs2_rms_cps,
         rms_frac_thresh=zp_rms_frac_thresh,
     )
     if mag_change > zp_max_mag_change:
@@ -133,7 +135,8 @@ def degrade_images(
                     hsc_pix_scale=legacy_pix_scale,
                     target_pix_scale=target_pix_scale,
                     lsst_fwhm=stats['seeing'],
-                    background_noise=stats['rms'],
+                    # ADU/s to match the count-rate image (see rcs2_rms_cps above).
+                    background_noise=stats['rms'] / stats['exp_time'],
                     background_median=stats['median'],
                     psf_transform=True,
                     add_poisson_noise=True,
