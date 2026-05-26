@@ -1,7 +1,6 @@
 __author__ = "furcelay"
 
 from astropy.wcs import WCS
-from reproject import reproject_adaptive
 import numpy as np
 
 
@@ -21,6 +20,11 @@ def resample_image(img, original_pix_scale, lsst_pix_scale=0.2, drop_edge=5, out
         If None, size is determined by input image size and pixel scales.
     :return: 2D numpy array, resampled image to LSST pixel scale
     """
+    # Imported lazily: reproject is only needed when an actual resample runs,
+    # so the package stays importable (and the pipeline wiring testable)
+    # without it installed.
+    from reproject import reproject_adaptive
+
     img_wcs = WCS(naxis=2)
     img_wcs.wcs.cd = np.array([[-1, 0],
                                [ 0, 1]]) * original_pix_scale / deg2arcsec
