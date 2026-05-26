@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Example/demo for the Legacy -> RCS2 degradation pipeline.
+
+Reads one or more (ra, dec) from an input table (.csv OR .fits; columns 'ra'
+and 'dec'), downloads the Legacy DR10 cutout, degrades it to an RCS2-like grz
+stamp, writes the stamps, and -- with --plot -- saves a side-by-side figure of
+the original Legacy frame and the degraded RCS2 stamp per band (FOV-matched).
+
+With no input table it falls back to a few built-in COSMOS positions, so it
+runs out of the box as a quick demonstration.
+"""
+
+from argparse import ArgumentParser
+import os
+
+import numpy as np
+from astropy.table import Table
+
+from legacy_to_rcs2.legacy_query.cutout import query_legacy_cutout
+from legacy_to_rcs2.legacy_query.tractor_props import query_tractor_props
+from legacy_to_rcs2.pipeline import (
+    degrade_images, write_degraded_images, LEGACY_PIX_SCALE, RCS2_PIX_SCALE,
+)
+from legacy_to_rcs2.rcs2_props.rcs2_samplers import load_rcs2_sampler
+
+DEFAULT_RCS2_PROPS_CSV = \
+    "/data/estudiantes/riugarte/rcs2/rcs2_props_sample/rcs2_props.csv"
+# Built-in fallback positions (COSMOS field, degrees J2000).
+EXAMPLE_RA = [150.1163, 150.0000, 149.8000]
+EXAMPLE_DEC = [2.2058, 2.3000, 2.1000]
+
+
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", default=None,
+                        help="Input table (.csv or .fits) with 'ra','dec'. "
+                             "If omitted, built-in COSMOS positions are used.")
+    parser.add_argument("--rcs2_props_csv", type=str, default=DEFAULT_RCS2_PROPS_CSV,
+                        help="characterize_rcs2 CSV the RCS2 sampler draws from")
+    parser.add_argument("--bands", type=str, default="grz",
+                        help="Bands to degrade (default 'grz')")
+    parser.add_argument("--output_dir", "-o", type=str, default="legacy_rcs2_example",
+                        help="Output directory for the degraded stamps")
+    parser.add_argument("--plot", action="store_true",
+                        help="Also save an original-vs-degraded comparison PNG per source")
+    parser.add_argument("--layer", type=str, default="ls-dr10",
+                        help="Legacy Survey layer (default 'ls-dr10')")
+    parser.add_argument("--cutout_size_pix", type=int, default=80,
+                        help="Legacy cutout download size in px (default 80)")
+    parser.add_argument("--stamp_pix", type=int, default=65,
+                        help="Output RCS2 stamp size in px (default 65)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base seed for the RCS2 condition sampler")
+    return parser.parse_args()
+
+
+def load_coords(path):
+    """Return a Table with 'ra','dec' from a .csv/.fits, or the built-in example."""
+    if path is None:
+        print("No input table given -> using built-in COSMOS example positions.")
+        return Table({'ra': EXAMPLE_RA, 'dec': EXAMPLE_DEC})
+    table = Table.read(path, format="ascii.csv") if path.lower().endswith(".csv") \
+        else Table.read(path)
+    for col in ("ra", "dec"):
+        if col not in table.colnames:
+            raise ValueError(f"Input table {path} has no '{col}' column "
+                             f"(found {table.colnames}).")
+    return table
+
+
+def center_crop(img, size):
+    """Center crop a 2D array to size x size (clamped to the array bounds)."""
+    ny, nx = img.shape
+    size = min(size, ny, nx)
+    y0 = max(0, int(round((ny - size) / 2.0)))
+    x0 = max(0, int(round((nx - size) / 2.0)))
+    return img[y0:y0 + size, x0:x0 + size]
+
+
+def main():
+    args = parse_args()
+    bands = args.bands
+    coords = load_coords(args.input)
+    rcs2_sampler = load_rcs2_sampler(args.rcs2_props_csv, bands=bands, seed=args.seed)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    plot_dir = os.path.join(args.output_dir, "plots")
+    if args.plot:
+        os.makedirs(plot_dir, exist_ok=True)
+    log_file = os.path.join(args.output_dir, "example_err.log")
+
+    # Legacy pixels covering the same sky area as the RCS2 stamp (for the plot).
+    match_px = int(round(args.stamp_pix * RCS2_PIX_SCALE / LEGACY_PIX_SCALE))
+
+    n_ok = 0
+    for idx, row in enumerate(coords):
+        ra, dec = float(row['ra']), float(row['dec'])
+        try:
+            cutout = query_legacy_cutout(ra, dec, bands=bands, layer=args.layer,
+                                         size_pix=args.cutout_size_pix)
+            tractor_props = query_tractor_props(ra, dec, bands=bands)
+            original = [cutout[b]['image'] for b in bands]
+            ok, degraded, _ = degrade_images(
+                original, tractor_props, rcs2_sampler, bands=bands,
+                out_size_pix=args.stamp_pix, log_file=log_file,
+            )
+        except Exception as e:
+            print(f"[{idx:03d}] ({ra:.4f},{dec:.4f}) query/degrade failed: "
+                  f"{type(e).__name__}: {e}")
+            continue
+        if not ok:
+            print(f"[{idx:03d}] ({ra:.4f},{dec:.4f}) degradation rejected (see {log_file})")
+            continue
+
+        out_base = os.path.join(args.output_dir, f"{idx:06d}")
+        write_degraded_images(out_base, degraded, bands)
+        n_ok += 1
+        msg = f"[{idx:03d}] ({ra:.4f},{dec:.4f}) -> {out_base}_<band>.fits"
+
+        if args.plot:
+            from legacy_to_rcs2.viz import plot_original_vs_degraded
+            png = os.path.join(plot_dir, f"{idx:06d}.png")
+            original_matched = [center_crop(im, match_px) for im in original]
+            plot_original_vs_degraded(
+                original_matched, degraded, bands, png,
+                title=f"RA={ra:.4f}  Dec={dec:.4f}",
+            )
+            msg += f"  | plot {png}"
+        print(msg)
+
+    print(f"Done: {n_ok}/{len(coords)} sources degraded into {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
